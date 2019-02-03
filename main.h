@@ -34,5 +34,6 @@ typedef struct {
 
 
 void next_channel(void);
+void radio_calibrate_channels(void);
 
 #endif

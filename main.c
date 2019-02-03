@@ -37,11 +37,15 @@ extern EXTERNAL_MEMORY uint8_t pbuffer[RAW_PACKET_BUFFER_SIZE];
 EXTERNAL_MEMORY FLASH_STORAGE flashStorage;
 uint8_t chanIndex = 0;
 uint8_t lostRxCnt = 16;
+uint8_t chanCals[16];
 
 void main(void) {
     EXTERNAL_MEMORY uint8_t packet[DECODED_PACKET_BUFFER_SIZE];
     uint8_t n = 0, n2, i, i2, out7[8], *in8, isBinding;
     uint16_t crc, rssiAvg = 1020;
+    int8_t driftFreq;
+    int16_t driftAvg = 0;
+    uint8_t driftCnt = 0;
 
     PORT2DIR(BIND_PORT) &= ~(1 << BIND_PIN); //set bind pin as input
     PORT2INP(BIND_PORT) &= ~(1 << BIND_PIN); //set pullup
@@ -77,8 +81,6 @@ void main(void) {
             flashStorage.trxId[i] = RNDL;
             flashStorage.trxId[i+1] = RNDH;
         }
-
-        flashStorage.hopTable[0] = 13; //set bind channel
     }
     else
         storage_read((uint8_t*)&flashStorage, sizeof(flashStorage)); //read rxId, txId and hopTable from flash
@@ -90,13 +92,18 @@ void main(void) {
 
     uart_init();
     radio_init();
-    next_channel();
 
-    if (!isBinding)
+    if (!isBinding) {
+        radio_calibrate_channels();
         IEN1 |= IEN1_T3IE; //enable channel hopping interrupt
+    }
+
+    RFST = RFST_SRX;
 
     while(1) {
         if (DMAIRQ & DMAIRQ_DMAIF0) {
+            driftFreq = (int8_t)FREQEST;
+
             if ((pbuffer[0]==0xC5) && (pbuffer[1]==0x2A)) { //check sync word, the cc2510 only supports 2byte + 1byte address, flysky uses 4 bytes 
                 n = 2; //Hamming(7,4) decode
                 n2 = 0;
@@ -136,14 +143,14 @@ void main(void) {
                         if (memcmp(packet+1, flashStorage.trxId, RTX_ID_SIZE*2)==0) { //txId and rxId matched, this pocket is for us
                             led_red_on();
 
-                            if (lostRxCnt>15) { //hopping desynced
+                            if (lostRxCnt==8) { //hopping desynced
                                 next_channel();
                                 T3CTL = T3CTL_DIV_8 | T3CTL_START | T3CTL_OVFIM | T3CTL_CLR | T3CTL_MODE_MODULO;
                                 T3CC0 = 87;
                             }
                             else { //sync hopping timer
-                                T3CC0 = 97 + T3CNT - 10;
-                                if ((T3CC0>101) || (T3CC0<93))
+                                T3CC0 = 87 + T3CNT;
+                                if (T3CC0>107)
                                     T3CC0 = 97;
                             }
                             lostRxCnt = 0;
@@ -169,6 +176,18 @@ void main(void) {
                             packet[37] = UART_PREPARE_DATA(LO(crc));
                             packet[38] = UART_PREPARE_DATA(HI(crc));
                             uart_start_transmission(packet+7, 31);
+
+                            driftCnt++;
+                            driftAvg += driftFreq;
+                            if (driftCnt==255) { //TX-RX frequency offset compensation
+                                driftAvg = driftAvg / 255;
+
+                                driftAvg += (int8_t)FSCTRL0;
+                                driftFreq = driftAvg;
+                                FSCTRL0 = (uint8_t)driftFreq;
+
+                               driftAvg = 0;
+                            }
 
                             led_red_off();
                         }
@@ -222,11 +241,13 @@ void main(void) {
                         if (!isBinding) { //binded save rxId, txId and hopTable, exit binding mode
                             storage_write((uint8_t*)&flashStorage, sizeof(flashStorage));
                             
+                            radio_calibrate_channels();
+
                             radio_setup_rf_dma(0);
                             radio_arm_dma();
 
                             IEN1 |= IEN1_T3IE;
-                            next_channel();
+                            RFST = RFST_SRX;
 
                             led_green_off();
                         }
@@ -240,15 +261,11 @@ void main(void) {
             else
                 radio_arm_dma();
         }
-        else if (!(MARCSTATE & 0x0C)) { //RX overflow or other error, handle it
+        else if (MARCSTATE==0x11) { //RX overflow, handle it, meg tud halni ha megkuldom tx powerrel ?
             RFST = RFST_SIDLE;
             while (MARCSTATE!=0x01);
-
-            radio_calibrate();
             radio_arm_dma();
-
-            chanIndex = 0;
-            next_channel();
+            RFST = RFST_SRX;
         }
 
         wdt_reset();
@@ -259,10 +276,12 @@ void main(void) {
 void timeout_interrupt(void) __interrupt T3_VECTOR { //hopping timer interrupt
     T3IF = 0;
     
-    if (lostRxCnt<16) {
+    if (lostRxCnt<8) {
         lostRxCnt++;
         next_channel();
     }
+    else
+        RFST = RFST_SRX;
 }
 
 //we need to use two base frequencies because the cc2510 matching channel step size is 250KHz, flysky is 500KHz
@@ -270,9 +289,7 @@ void next_channel() {
     uint8_t chan;
 
     RFST = RFST_SIDLE;
-
     chan = flashStorage.hopTable[chanIndex];
-    chanIndex = (chanIndex + 1) & 0x0F;
 
     if (chan<128) { //2400MHz base freq
         FREQ2 = 0x5C;
@@ -286,6 +303,39 @@ void next_channel() {
         FREQ0 = 0xD8;
     }
     CHANNR = chan * 2;
+    FSCAL1 = chanCals[chanIndex];
 
+    chanIndex = (chanIndex + 1) & 0x0F;
     RFST = RFST_SRX;
+}
+
+void radio_calibrate_channels() {
+    uint8_t i, chan;
+
+    RFST = RFST_SIDLE;
+    while (MARCSTATE!=0x01);
+
+    for (i=0;i<16;i++) {
+        chan = flashStorage.hopTable[i];
+
+        if (chan<128) { //2400MHz base freq
+            FREQ2 = 0x5C;
+            FREQ1 = 0x4E;
+            FREQ0 = 0xC4;
+        }
+        else { //2419MHz base freq
+            chan -= 38;
+            FREQ2 = 0x5D;
+            FREQ1 = 0x09;
+            FREQ0 = 0xD8;
+        }
+        CHANNR = chan * 2;
+
+        RFST = RFST_SCAL;
+        while (MARCSTATE!=0x01);
+
+        chanCals[i] = FSCAL1;
+    }
+
+    MCSM0 = 0x04;
 }

@@ -29,31 +29,30 @@ EXTERNAL_MEMORY uint8_t pbuffer[RAW_PACKET_BUFFER_SIZE];
 void radio_init(void) {
     RFST = RFST_SIDLE;
 
+    SYNC1 = 0x54; //flysky sync word
+    SYNC0 = 0x75;
     PKTLEN = RAW_PACKET_LENGTH;
-    PKTCTRL0 = 0x00; //fix packet length, crc disabled
     
-    FSCTRL1 = 0x0A; //500k if
-    FSCTRL0 = 0x00;
+    PKTCTRL1 = 0x05; //address check, append status
+    PKTCTRL0 = 0x00; //fix packet length, crc disabled
+    ADDR = 0xC5; //extra sync check byte
+
+    FSCTRL1 = 0x10; //406.250KHk if
 
     MDMCFG4 = 0x0E; //500 kBaud data rate, channel filter bandwidth 812.5KHz
     MDMCFG3 = 0x3B;
     MDMCFG2 = 0x05; //FSK, 15 bit carrier-sense + 16 bit sync word match + carrier above threshold
     MDMCFG1 = 0x23; //4 byte permable transmitted
     MDMCFG0 = 0x3B; //channel spacing 250KHz
-    
     DEVIATN = 0x67; //190.43KHz fsk deviation insted of the flysky 186Khz :(
 
-    MCSM1 = 0x0F; //go back to rx after transmission completed
-    MCSM0 = 0x14;    
+    MCSM1 = 0x03;//go back to rx after tx
+    MCSM0 = 0x14; //call mode: when going from IDLE to RX or TX (or FSTXON)   
     FOCCFG = 0x1D;
     BSCFG = 0x1C;
-
     AGCCTRL2 = 0xC7;
-    AGCCTRL1 = 0x00;
+    AGCCTRL1 = 0x40;
     AGCCTRL0 = 0xB2;
-
-    FREND1 = 0xB6;
-    FREND0 = 0x10;
 
     FSCAL1 = 0x00;
     FSCAL0 = 0x11;
@@ -62,14 +61,6 @@ void radio_init(void) {
     TEST0 = 0x09;
 
     PA_TABLE0 = 0xFF; //1dBm tx power (max)
-
-    SYNC1 = 0x54; //flysky sync word
-    SYNC0 = 0x75;
-
-    ADDR = 0xc5; //extra sync check byte
-
-    //address check
-    PKTCTRL1 = CC2500_PKTCTRL1_CRC_AUTOFLUSH | CC2500_PKTCTRL1_FLAG_ADR_CHECK_01 | CC2500_PKTCTRL1_APPEND_STATUS;
 
     radio_calibrate();
 
@@ -83,12 +74,13 @@ void radio_calibrate() {
     FREQ1 = 0x4E;
     FREQ0 = 0xC4;
 
-    CHANNR = 127;
+    CHANNR = 26; //bind channel
     
-    FSCAL3 = 0xEA;
+    FSCAL3 = 0xEA; //enable charge pump calibration
     RFST = RFST_SCAL;
-    while (MARCSTATE!=0x01) {}
-    FSCAL3 = 0xCA;
+    while (MARCSTATE!=0x01);
+
+    FSCAL3 = FSCAL3 & 0xCF; //disable charge pump calibration
 }
 
 void radio_setup_rf_dma(uint8_t isTx) {
